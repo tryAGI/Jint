@@ -1,0 +1,136 @@
+name: Publish tryAGI.Jint
+
+# Republishes upstream sebastienros/jint as the nuget.org package tryAGI.Jint.
+#
+# Why this exists: upstream ships Jint 5 previews only to its feedz.io feed, which keeps the newest 28
+# builds and deletes the rest, so any pinned preview stops restoring within days. nuget.org never deletes
+# a version. The package is upstream's code, unchanged: same assembly name (Jint), namespace and strong-name
+# key, only the package ID differs. A consumer swaps the PackageReference and nothing else.
+#
+# Tracking upstream: the scheduled run builds upstream main; a version is published only when upstream main
+# has moved, because the version is derived from upstream's commit count.
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'sebastienros/jint ref to publish (branch, tag or commit)'
+        required: false
+        default: 'main'
+      version_prefix:
+        description: 'Version prefix; the preview number is the upstream commit count'
+        required: false
+        default: '5.0.0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-tryagi-jint
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  PACKAGE_ID: tryAGI.Jint
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Exchanged by NuGet/login for a short-lived nuget.org key (trusted publishing). Must stay in this
+      # caller workflow: the nuget.org policy matches this file's name.
+      id-token: write
+
+    steps:
+      - name: Checkout upstream
+        uses: actions/checkout@v5
+        with:
+          repository: sebastienros/jint
+          ref: ${{ inputs.ref || 'main' }}
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0
+            10.0
+
+      - name: Determine version
+        id: version
+        env:
+          PREFIX: ${{ inputs.version_prefix || vars.JINT_VERSION_PREFIX || '5.0.0' }}
+        run: |
+          count="$(git rev-list --count HEAD)"
+          commit="$(git rev-parse HEAD)"
+          version="${PREFIX}-preview.${count}"
+          {
+            echo "version=$version"
+            echo "numeric=${PREFIX}"
+            echo "commit=$commit"
+          } >> "$GITHUB_OUTPUT"
+          id="$(echo "$PACKAGE_ID" | tr '[:upper:]' '[:lower:]')"
+          if curl -fsS "https://api.nuget.org/v3-flatcontainer/$id/index.json" 2>/dev/null \
+              | jq -e --arg v "$(echo "$version" | tr '[:upper:]' '[:lower:]')" '.versions | index($v)' >/dev/null; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$PACKAGE_ID $version (upstream $commit) is already on nuget.org; nothing to do."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            echo "Publishing $PACKAGE_ID $version from upstream $commit"
+          fi
+
+      - name: Test
+        if: steps.version.outputs.published == 'false'
+        run: dotnet test Jint.Tests/Jint.Tests.csproj --configuration Release --framework net10.0
+
+      - name: Pack
+        if: steps.version.outputs.published == 'false'
+        run: >
+          dotnet pack Jint/Jint.csproj --output artifacts --configuration Release
+          -p:PackageId=${{ env.PACKAGE_ID }}
+          -p:Version=${{ steps.version.outputs.version }}
+          -p:AssemblyVersion=${{ steps.version.outputs.numeric }}
+          -p:FileVersion=${{ steps.version.outputs.numeric }}
+          -p:RepositoryUrl=https://github.com/sebastienros/jint
+          -p:RepositoryCommit=${{ steps.version.outputs.commit }}
+          -p:PackageProjectUrl=https://github.com/tryAGI/Jint
+          "-p:Description=Unmodified build of the Jint JavaScript interpreter (https://github.com/sebastienros/jint) at upstream commit ${{ steps.version.outputs.commit }}, republished to nuget.org because upstream previews are not retained. Assembly name, namespace and strong-name key are upstream's."
+          -p:ContinuousIntegrationBuild=true
+
+      - name: Verify package contents
+        if: steps.version.outputs.published == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          package="artifacts/$PACKAGE_ID.$VERSION.nupkg"
+          test -f "$package"
+          listing="$(unzip -Z1 "$package")"
+          echo "$listing"
+          # The assembly keeps upstream's identity, so consumers need no code change.
+          echo "$listing" | grep -qx 'lib/net10.0/Jint.dll'
+          # The [JsAccessible] generator ships inside the package; the internal generator must never.
+          echo "$listing" | grep -qx 'analyzers/dotnet/cs/Jint.SourceGenerators.Interop.dll'
+          if echo "$listing" | grep -q 'analyzers/dotnet/cs/Jint.SourceGenerators.dll'; then
+            echo "::error::The internal Jint.SourceGenerators analyzer must not be packed."
+            exit 1
+          fi
+          unzip -p "$package" '*.nuspec' | grep -q "<id>$PACKAGE_ID</id>"
+
+      # Kept next to the push: the minted key is short-lived.
+      - name: NuGet login
+        if: steps.version.outputs.published == 'false'
+        uses: NuGet/login@v1
+        id: login
+        with:
+          # The nuget.org account that created the trusted publishing policy, not the package owner org.
+          user: ${{ vars.NUGET_USER || 'havendv' }}
+
+      - name: Push
+        if: steps.version.outputs.published == 'false'
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+        run: dotnet nuget push "artifacts/*.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
