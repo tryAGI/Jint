@@ -83,6 +83,26 @@ jobs:
             echo "Publishing $PACKAGE_ID $version from upstream $commit"
           fi
 
+      # Trusted publishing is this workflow's only credential, and a missing or mismatched nuget.org policy
+      # fails the token exchange with HTTP 401. Gate on it here, before the ~10 minutes of test and pack,
+      # so a policy problem fails the run in seconds and names the fields to fix instead of surfacing at the
+      # very last step. The key minted here is thrown away; the push mints its own, because they are short-lived.
+      - name: Verify trusted publishing policy
+        if: steps.version.outputs.published == 'false'
+        id: preflight
+        continue-on-error: true
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER || 'havendv' }}
+
+      - name: Explain a missing trusted publishing policy
+        if: steps.version.outputs.published == 'false' && steps.preflight.outcome == 'failure'
+        env:
+          NUGET_USER: ${{ vars.NUGET_USER || 'havendv' }}
+        run: |
+          echo "::error::No usable nuget.org trusted publishing policy, so the token exchange would fail with HTTP 401. Create one at https://www.nuget.org/account/trustedpublishing while signed in as '$NUGET_USER', then re-run. It must match this workflow exactly: policy creator user '$NUGET_USER' (this is what NuGet/login sends, and it is the creator of the policy, not the package owner organization); package owner = the nuget.org account that owns $PACKAGE_ID; package pattern '$PACKAGE_ID' entered as a pattern rather than picked from existing packages, because $PACKAGE_ID has no published version yet; repository owner 'tryAGI'; repository 'Jint'; workflow file 'publish.yml'; environment left empty, because this job declares none."
+          exit 1
+
       - name: Test
         if: steps.version.outputs.published == 'false'
         run: dotnet test Jint.Tests/Jint.Tests.csproj --configuration Release --framework net10.0

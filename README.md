@@ -25,6 +25,26 @@ given to `workflow_dispatch`), runs upstream's tests, packs, verifies the packag
 published only when upstream `main` has moved. Publishing uses nuget.org trusted publishing (OIDC); the repository
 holds no API key.
 
+## Trusted publishing policy
+
+The workflow holds no API key; it exchanges a GitHub OIDC token for a short-lived nuget.org key. That exchange
+only works if a matching policy exists on nuget.org, and nothing in this repository can create it. Without one the
+run fails with `Token exchange failed (HTTP 401) ... No matching trust policy owned by user '<user>' was found`,
+which is why `publish.yml` checks for it before the test and pack steps rather than at the push.
+
+Create the policy at [nuget.org/account/trustedpublishing](https://www.nuget.org/account/trustedpublishing),
+signed in as the **creator** user, with exactly these values:
+
+| Field | Value |
+|-------|-------|
+| Policy creator (signed-in user) | `havendv` — this is what `NuGet/login` sends as `user`, overridable with the `NUGET_USER` repository variable. It is the account that creates the policy, not the package owner organization. |
+| Package owner | The nuget.org account that owns `tryAGI.Jint` |
+| Package | `tryAGI.Jint`, entered as a pattern — it cannot be picked from a list until a first version exists |
+| Repository owner | `tryAGI` |
+| Repository | `Jint` |
+| Workflow file | `publish.yml` — the policy matches the caller workflow's filename, which is why `id-token: write` and `NuGet/login` must stay in this file and not move into a reusable workflow |
+| Environment | Empty; the `publish` job declares no environment |
+
 ## License
 
 Jint is BSD-2-Clause licensed by Sébastien Ros and contributors; see upstream's
