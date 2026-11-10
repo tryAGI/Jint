@@ -87,6 +87,7 @@ jobs:
         if: steps.version.outputs.published == 'false'
         run: dotnet test Jint.Tests/Jint.Tests.csproj --configuration Release --framework net10.0
 
+      # MSBuild splits a -p: value on ',' and ';' (MSB1006), so property values here must contain neither.
       - name: Pack
         if: steps.version.outputs.published == 'false'
         run: >
@@ -98,7 +99,7 @@ jobs:
           -p:RepositoryUrl=https://github.com/sebastienros/jint
           -p:RepositoryCommit=${{ steps.version.outputs.commit }}
           -p:PackageProjectUrl=https://github.com/tryAGI/Jint
-          "-p:Description=Unmodified build of the Jint JavaScript interpreter (https://github.com/sebastienros/jint) at upstream commit ${{ steps.version.outputs.commit }}, republished to nuget.org because upstream previews are not retained. Assembly name, namespace and strong-name key are upstream's."
+          "-p:Description=Unmodified build of the Jint JavaScript interpreter (https://github.com/sebastienros/jint) at upstream commit ${{ steps.version.outputs.commit }}. Republished to nuget.org because upstream previews are not retained. Assembly name and namespace and strong-name key are upstream's."
           -p:ContinuousIntegrationBuild=true
 
       - name: Verify package contents
