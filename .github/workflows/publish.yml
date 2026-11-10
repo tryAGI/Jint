@@ -50,8 +50,26 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: sebastienros/jint
-          ref: ${{ inputs.ref || 'main' }}
           fetch-depth: 0
+
+      # actions/checkout resolves `ref:` as a branch, a tag or a FULL commit SHA, so an abbreviated SHA
+      # fails the checkout itself: "A branch or tag with the name 'f73ea2805f' could not be found". The
+      # clone above is unshallow and carries every branch and tag, so resolve the input here instead, where
+      # an abbreviated SHA works and an unresolvable one says what was tried.
+      - name: Resolve requested ref
+        env:
+          REQUESTED_REF: ${{ inputs.ref || 'main' }}
+        run: |
+          set -euo pipefail
+          for candidate in "origin/$REQUESTED_REF" "refs/tags/$REQUESTED_REF" "$REQUESTED_REF"; do
+            if sha="$(git rev-parse --verify --quiet "${candidate}^{commit}")"; then
+              echo "Resolved '$REQUESTED_REF' to $sha via $candidate"
+              git checkout --quiet --detach "$sha"
+              exit 0
+            fi
+          done
+          echo "::error::Cannot resolve ref '$REQUESTED_REF' in sebastienros/jint. Tried branch 'origin/$REQUESTED_REF', tag 'refs/tags/$REQUESTED_REF' and commit '$REQUESTED_REF'. Pass a branch, a tag or a commit SHA that exists upstream."
+          exit 1
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v5
@@ -83,25 +101,16 @@ jobs:
             echo "Publishing $PACKAGE_ID $version from upstream $commit"
           fi
 
-      # Trusted publishing is this workflow's only credential, and a missing or mismatched nuget.org policy
-      # fails the token exchange with HTTP 401. Gate on it here, before the ~10 minutes of test and pack,
-      # so a policy problem fails the run in seconds and names the fields to fix instead of surfacing at the
-      # very last step. The key minted here is thrown away; the push mints its own, because they are short-lived.
+      # Gate on the trusted-publishing policy before the ~10 minutes of test and pack, so a policy problem
+      # fails the run in seconds and names the fields to fix rather than surfacing at the very last step.
+      # The action must be a step of this job, not a reusable workflow: nuget.org matches the policy against
+      # job_workflow_ref, so the policy names this repository and this file.
       - name: Verify trusted publishing policy
         if: steps.version.outputs.published == 'false'
-        id: preflight
-        continue-on-error: true
-        uses: NuGet/login@v1
+        uses: tryAGI/workflows/.github/actions/nuget-trusted-publish-check@main
         with:
           user: ${{ vars.NUGET_USER || 'havendv' }}
-
-      - name: Explain a missing trusted publishing policy
-        if: steps.version.outputs.published == 'false' && steps.preflight.outcome == 'failure'
-        env:
-          NUGET_USER: ${{ vars.NUGET_USER || 'havendv' }}
-        run: |
-          echo "::error::No usable nuget.org trusted publishing policy, so the token exchange would fail with HTTP 401. Create one at https://www.nuget.org/account/trustedpublishing while signed in as '$NUGET_USER', then re-run. It must match this workflow exactly: policy creator user '$NUGET_USER' (this is what NuGet/login sends, and it is the creator of the policy, not the package owner organization); package owner = the nuget.org account that owns $PACKAGE_ID; package pattern '$PACKAGE_ID' entered as a pattern rather than picked from existing packages, because $PACKAGE_ID has no published version yet; repository owner 'tryAGI'; repository 'Jint'; workflow file 'publish.yml'; environment left empty, because this job declares none."
-          exit 1
+          packages: ${{ env.PACKAGE_ID }}
 
       - name: Test
         if: steps.version.outputs.published == 'false'
@@ -155,3 +164,35 @@ jobs:
         env:
           NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
         run: dotnet nuget push "artifacts/*.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+
+  # Nobody watches a 03:17 cron, so a scheduled failure would otherwise stay invisible until someone noticed
+  # that nuget.org had stopped following upstream. Keep one open issue and comment on it, rather than filing
+  # a fresh issue every night the failure persists.
+  report-scheduled-failure:
+    needs: publish
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: Scheduled publish of tryAGI.Jint is failing
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          body="The scheduled publish failed on $(date -u '+%Y-%m-%d %H:%M UTC'): $RUN_URL
+
+          While it keeps failing, nuget.org stops following upstream sebastienros/jint and no new
+          \`tryAGI.Jint\` preview is published. The run log names the failing step; a token exchange
+          failure means the nuget.org trusted-publishing policy needs attention (see the README)."
+          existing="$(gh issue list --state open --json number,title --jq '[.[] | select(.title == env.TITLE) | .number] | first // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+            echo "Commented on existing issue #$existing"
+          else
+            gh issue create --title "$TITLE" --body "$body"
+          fi
